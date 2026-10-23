@@ -14,11 +14,16 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import okhttp3.Dns
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.dnsoverhttps.DnsOverHttps
 import java.io.IOException
+import java.net.InetAddress
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 class GeminiException(message: String, val retryable: Boolean = false) : Exception(message)
@@ -43,6 +48,7 @@ class Gemini(
     private val base = "https://generativelanguage.googleapis.com"
     private val jsonType = "application/json; charset=utf-8".toMediaType()
     private val http = OkHttpClient.Builder()
+        .dns(FallbackDns)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(300, TimeUnit.SECONDS)
         .writeTimeout(300, TimeUnit.SECONDS)
@@ -184,7 +190,12 @@ class Gemini(
                 return body
             }
         } catch (e: IOException) {
-            throw GeminiException("Network error: ${e.message ?: "check your internet connection"}", retryable = true)
+            val msg = if (e is UnknownHostException) {
+                "Can't reach Google's AI server from this phone. Check your internet, turn off any VPN or ad blocker, and set Private DNS to Automatic."
+            } else {
+                "Network error: ${e.message ?: "check your internet connection"}"
+            }
+            throw GeminiException(msg, retryable = true)
         }
     }
 
@@ -220,4 +231,43 @@ class Gemini(
 
     private fun JsonObject.str(key: String): String? =
         this[key]?.let { runCatching { it.jsonPrimitive.content }.getOrNull() }
+}
+
+/**
+ * Uses the phone's DNS first. If that fails (blocked Private DNS, ad blockers,
+ * some campus networks), looks the host up over HTTPS via Google or Cloudflare,
+ * the same way Chrome's secure DNS does.
+ */
+private object FallbackDns : Dns {
+    private val bootstrap = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
+
+    private val resolvers: List<DnsOverHttps> = listOf(
+        DnsOverHttps.Builder().client(bootstrap)
+            .url("https://dns.google/dns-query".toHttpUrl())
+            .bootstrapDnsHosts(listOf("8.8.8.8", "8.8.4.4").map(InetAddress::getByName))
+            .build(),
+        DnsOverHttps.Builder().client(bootstrap)
+            .url("https://cloudflare-dns.com/dns-query".toHttpUrl())
+            .bootstrapDnsHosts(listOf("1.1.1.1", "1.0.0.1").map(InetAddress::getByName))
+            .build(),
+    )
+
+    override fun lookup(hostname: String): List<InetAddress> {
+        val systemError = try {
+            return Dns.SYSTEM.lookup(hostname)
+        } catch (e: UnknownHostException) {
+            e
+        }
+        for (r in resolvers) {
+            try {
+                val found = r.lookup(hostname)
+                if (found.isNotEmpty()) return found
+            } catch (ignored: Exception) {
+            }
+        }
+        throw systemError
+    }
 }
