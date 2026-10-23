@@ -31,7 +31,10 @@ import com.inventornext.vivacoach.data.parseModelJson
 import com.inventornext.vivacoach.voice.Listener
 import com.inventornext.vivacoach.voice.Speaker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
@@ -132,7 +135,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun loadModels() = viewModelScope.launch {
         modelStatus = "Checking your key..."
         modelStatus = try {
-            models = gemini.listModels().filter { it.startsWith("gemini") }.sortedDescending()
+            val skip = listOf("image", "tts", "live", "transcribe", "embedding", "banana", "omni", "audio", "veo", "imagen")
+            models = gemini.listModels()
+                .filter { m -> m.startsWith("gemini") && skip.none { m.contains(it) } }
+                .sortedDescending()
             "Key works. ${models.size} models available. Pick one below."
         } catch (e: Exception) {
             models = emptyList()
@@ -357,6 +363,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun abandonIfEmpty() {
+        busyJob?.cancel()
         val s = current ?: return
         if (s.report == null) {
             if (s.answered.isEmpty()) repo.deleteSession(s.id)
@@ -373,20 +380,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         sessions = repo.sessions()
     }
 
+    var busySince by mutableStateOf(0L)
+        private set
+    private var busyJob: Job? = null
+
     private fun task(label: String, again: () -> Unit, block: suspend () -> Unit) {
         if (busy != null) return
         busy = label
+        busySince = System.currentTimeMillis()
         error = null
         retry = again
-        viewModelScope.launch {
+        busyJob = viewModelScope.launch {
             try {
-                block()
-            } catch (e: Exception) {
-                error = e.message ?: "Something went wrong."
+                withTimeout(5 * 60_000L) { block() }
+            } catch (e: TimeoutCancellationException) {
+                error = "The examiner took more than 5 minutes. Check your internet and tap Retry. " +
+                    "If it keeps happening, pick a different \"flash\" model in Settings."
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                error = e.message ?: e.javaClass.simpleName
             } finally {
                 busy = null
+                busyJob = null
             }
         }
+    }
+
+    /** User tapped Cancel while waiting. */
+    fun cancelBusy() {
+        busyJob?.cancel()
+        busy = null
+        error = "Stopped. Tap Retry to try again."
     }
 
     override fun onCleared() {

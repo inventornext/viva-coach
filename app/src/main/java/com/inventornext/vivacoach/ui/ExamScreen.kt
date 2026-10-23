@@ -61,6 +61,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.delay
 import com.inventornext.vivacoach.AppViewModel
 import com.inventornext.vivacoach.R
 import com.inventornext.vivacoach.ai.Persona
@@ -189,10 +190,18 @@ fun ExamScreen(vm: AppViewModel) {
             }
             if (busy != null) {
                 item(key = "busy") {
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(8.dp)) {
+                    var seconds by remember { mutableStateOf(0L) }
+                    LaunchedEffect(vm.busySince) {
+                        while (true) {
+                            seconds = (System.currentTimeMillis() - vm.busySince) / 1000
+                            delay(1000)
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(8.dp)) {
                         CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.size(10.dp))
-                        Text("$busy...", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("$busy... ${seconds}s", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                        if (seconds >= 20) TextButton(onClick = { vm.cancelBusy() }) { Text("Cancel") }
                     }
                 }
             }

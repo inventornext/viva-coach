@@ -14,7 +14,11 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.Dns
+import okhttp3.Response
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -22,6 +26,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.dnsoverhttps.DnsOverHttps
 import java.io.IOException
+import java.io.InterruptedIOException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
@@ -52,6 +59,7 @@ class Gemini(
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(300, TimeUnit.SECONDS)
         .writeTimeout(300, TimeUnit.SECONDS)
+        .callTimeout(240, TimeUnit.SECONDS)
         .build()
 
     private fun apiKey(): String {
@@ -89,14 +97,7 @@ class Gemini(
                 .header("X-Goog-Upload-Header-Content-Type", mime)
                 .post(startBody)
                 .build()
-            val uploadUrl = try {
-                http.newCall(start).execute().use { r ->
-                    if (!r.isSuccessful) throw GeminiException(errorMessage(r.code, r.body?.string().orEmpty()))
-                    r.header("x-goog-upload-url") ?: throw GeminiException("Upload failed: no upload URL returned.")
-                }
-            } catch (e: IOException) {
-                throw GeminiException("Network error: ${e.message}", retryable = true)
-            }
+            val uploadUrl = callForHeader(start, "x-goog-upload-url")
 
             val upload = Request.Builder()
                 .url(uploadUrl)
@@ -180,23 +181,64 @@ class Gemini(
         throw last ?: GeminiException("Unknown error")
     }
 
-    private fun call(req: Request): String {
-        try {
-            http.newCall(req).execute().use { r ->
-                val body = r.body?.string().orEmpty()
-                if (!r.isSuccessful) {
-                    throw GeminiException(errorMessage(r.code, body), retryable = r.code == 429 || r.code >= 500)
+    private suspend fun callForHeader(req: Request, header: String): String = suspendCancellableCoroutine { cont ->
+        val c = http.newCall(req)
+        cont.invokeOnCancellation { c.cancel() }
+        c.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWithException(GeminiException("Network error: ${e.message}", retryable = true))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use { r ->
+                    if (!cont.isActive) return
+                    val value = r.header(header)
+                    when {
+                        !r.isSuccessful -> cont.resumeWithException(GeminiException(errorMessage(r.code, r.body?.string().orEmpty())))
+                        value == null -> cont.resumeWithException(GeminiException("Upload failed: no upload URL returned."))
+                        else -> cont.resume(value)
+                    }
                 }
-                return body
             }
-        } catch (e: IOException) {
-            val msg = if (e is UnknownHostException) {
-                "Can't reach Google's AI server from this phone. Check your internet, turn off any VPN or ad blocker, and set Private DNS to Automatic."
-            } else {
-                "Network error: ${e.message ?: "check your internet connection"}"
+        })
+    }
+
+    /** Runs a request; cancelling the coroutine cancels the HTTP call immediately. */
+    private suspend fun call(req: Request): String = suspendCancellableCoroutine { cont ->
+        val c = http.newCall(req)
+        cont.invokeOnCancellation { c.cancel() }
+        c.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (!cont.isActive) return
+                val msg = when {
+                    e is UnknownHostException ->
+                        "Can't reach Google's AI server from this phone. Check your internet, turn off any VPN or ad blocker, and set Private DNS to Automatic."
+                    e is InterruptedIOException ->
+                        "Gemini took too long to answer. Check your internet and tap Retry."
+                    else -> "Network error: ${e.message ?: "check your internet connection"}"
+                }
+                cont.resumeWithException(GeminiException(msg, retryable = true))
             }
-            throw GeminiException(msg, retryable = true)
-        }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use { r ->
+                    val body = try {
+                        r.body?.string().orEmpty()
+                    } catch (e: IOException) {
+                        if (cont.isActive) cont.resumeWithException(GeminiException("Network error: ${e.message}", retryable = true))
+                        return
+                    }
+                    if (!cont.isActive) return
+                    if (!r.isSuccessful) {
+                        cont.resumeWithException(
+                            GeminiException(errorMessage(r.code, body), retryable = r.code == 429 || r.code >= 500),
+                        )
+                    } else {
+                        cont.resume(body)
+                    }
+                }
+            }
+        })
     }
 
     private fun extractText(body: String): String {
