@@ -5,13 +5,16 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -29,3 +32,13 @@ jobs:
           path: |
             app/build/outputs/apk/debug/*.apk
             app/build/outputs/apk/release/*.apk
+
+      - name: Publish APK as latest release
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk VivaCoach.apk
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest VivaCoach.apk \
+            --title "Viva Coach (latest build)" \
+            --notes "Built from commit ${GITHUB_SHA::7}. Download VivaCoach.apk on your phone and install it."
+        env:
+          GH_TOKEN: ${{ github.token }}
